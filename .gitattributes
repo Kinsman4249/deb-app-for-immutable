@@ -1,0 +1,10 @@
+# Files listed here with export-ignore are left OUT of the archives that
+# `git archive` builds, which is what the release workflow attaches to a
+# GitHub Release. This keeps template scaffolding out of the published zips.
+#
+# If your project WANTS its .github/ directory inside the release zip (for
+# example so the workflow travels with the download), delete that line.
+
+_template/ export-ignore
+.github/   export-ignore
+.gitattributes export-ignore

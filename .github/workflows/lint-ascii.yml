@@ -1,0 +1,72 @@
+# ASCII-only lint: fails if any tracked Markdown file contains an em dash,
+# a smart quote, or an emoji. Runs on every push and pull request.
+#
+# WHY: this repo's style rule is ASCII-only prose (no em dashes, smart
+# quotes, or emoji). Enforcing it here means nobody - human or LLM - has to
+# remember to check by hand.
+#
+# CUSTOMIZING: this only scans *.md files. To cover other extensions, add
+# them to the `git ls-files` pattern below.
+
+name: Lint ASCII
+
+on:
+  push:
+    paths:
+      - '**/*.md'
+  pull_request:
+    paths:
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ascii-only:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Check for em dashes, smart quotes, and emoji in Markdown
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # U+2014 em dash, U+2018/2019 single smart quotes,
+          # U+201C/201D double smart quotes.
+          banned_punct='\x{2014}\x{2018}\x{2019}\x{201C}\x{201D}'
+
+          # Common emoji blocks. Not exhaustive, but covers everything
+          # likely to be pasted from a chat client or editor.
+          emoji_ranges='\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}\x{2B00}-\x{2BFF}\x{1F1E6}-\x{1F1FF}'
+
+          pattern="[$banned_punct$emoji_ranges]"
+
+          if [ -z "$(git ls-files '*.md')" ]; then
+            echo "No Markdown files tracked, nothing to lint."
+            exit 0
+          fi
+
+          # Collect the matches instead of branching on grep's exit status.
+          # xargs may split a large file list into several grep calls, and its
+          # exit status only reflects the LAST one - so a hit in an early batch
+          # could be reported as a pass. Concatenated output cannot lie that
+          # way. -z/-0 keeps filenames with spaces intact; -r skips grep
+          # entirely on empty input; -H forces the filename prefix even when
+          # only one file is passed.
+          matches=$(git ls-files -z '*.md' \
+            | xargs -0 -r grep -HnP "$pattern" -- || true)
+
+          if [ -n "$matches" ]; then
+            printf '%s\n' "$matches"
+            echo
+            echo "Found em dashes, smart quotes, or emoji in the Markdown above."
+            echo "Replace with plain ASCII (hyphen, straight quotes, no emoji)."
+            exit 1
+          fi
+
+          echo "No banned characters found."

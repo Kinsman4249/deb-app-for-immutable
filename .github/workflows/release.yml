@@ -1,0 +1,439 @@
+# Release: tags a version -> stamps release metadata -> packages the repo ->
+# publishes a GitHub Release.
+#
+# DEFAULT BEHAVIOR (no edits needed): on `git push origin v1.2.3` this bundles
+# the tagged commit into a .tar.gz and a .zip and attaches both to a new
+# Release with auto-generated notes. That is all most projects need.
+#
+# BSL CHANGE DATE: if the repo has a LICENSE with a `Change Date:` line
+# (Business Source License 1.1), the prepare job below rolls that date forward
+# to four years out, bumps the copyright year, commits the change, and moves
+# the tag onto the amended commit so the date ships INSIDE the release. Repos
+# with no LICENSE, or a LICENSE that is not BSL, skip it silently. Nothing to
+# configure either way.
+#
+# ADDING A COMPILED BUILD: uncomment ONE language block in the marked section.
+# It runs alongside the source bundle and adds its binaries to the same
+# Release. You do not need to remove the bundle step.
+#
+# ACTION PINNING: uses: lines are on version tags, not SHAs, on purpose.
+# Do NOT auto-pin or run pinact without asking the maintainer first. Pins
+# rot into unpatched deps on a repo with no Dependabot upkeep.
+#
+# RUNNING MANUALLY: Actions tab > Release > Run workflow > enter an existing tag.
+
+name: Release
+
+on:
+  # Auto-trigger when a version tag like v0.1.0 / v1.2.3 is pushed.
+  push:
+    tags:
+      - 'v*.*.*'
+  # Manual fallback: re-run a release for an already-existing tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.0.0). Must already exist.'
+        required: true
+        type: string
+
+# Least privilege: default every job to read-only. Only the jobs that actually
+# write (prepare, release) elevate, and only to the permission they need.
+permissions:
+  contents: read
+
+# Stop two runs for the same tag from racing (e.g. a re-pushed tag while the
+# first run is still publishing). Do not cancel an in-flight publish.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ===========================================================================
+  # PREPARE: stamps release metadata into the tagged commit, then force-moves
+  # the tag onto the amended commit so build and release use it.
+  #
+  # Why it has to happen here rather than as a follow-up commit: BSL 1.1 caps
+  # the Change Date at the fourth anniversary of a version's first public
+  # distribution, so the date has to be in the commit the tag points at. Editing
+  # it afterwards would leave the published archive claiming the old date.
+  #
+  # This only proceeds when the tag points at the default branch's current tip
+  # (the normal "commit, tag, push" flow). A tag created anywhere else is left
+  # untouched and the job fails loudly rather than silently rewriting history
+  # somewhere unexpected.
+  #
+  # NOTE: this job pushes to the default branch. If that branch is protected,
+  # either grant the actions bot an exception or delete this job and bump
+  # LICENSE by hand before tagging.
+  # ===========================================================================
+  prepare:
+    name: Stamp release metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the default branch
+        uses: actions/checkout@v7
+        with:
+          # Not hardcoded to "main": this file ships to repos whose default
+          # branch may be called something else.
+          ref: ${{ github.event.repository.default_branch }}
+          # Full history here on purpose. This job compares the tag against the
+          # branch tip and pushes a commit, so unlike the build job it genuinely
+          # needs more than a single-commit clone.
+          fetch-depth: 0
+
+      - name: Verify tag points at the default branch tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.resolve.outputs.tag }}"
+          # ^{commit} peels an annotated tag to the commit it points at - a
+          # bare `git rev-parse refs/tags/$tag` returns the tag OBJECT's own
+          # SHA for annotated tags, which never matches a commit SHA.
+          tag_sha="$(git rev-parse "refs/tags/$tag^{commit}")"
+          head_sha="$(git rev-parse HEAD)"
+          if [[ "$tag_sha" != "$head_sha" ]]; then
+            echo "::error::Tag $tag ($tag_sha) does not point at the tip of ${{ github.event.repository.default_branch }} ($head_sha)."
+            echo "This workflow only amends a tag created at the branch tip. Re-tag from the default branch and push again, or bump LICENSE by hand and delete the prepare job."
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # BSL Change Date. Skips cleanly when there is no LICENSE or no
+      # "Change Date:" line, so a non-BSL repo needs no edits here.
+      # -----------------------------------------------------------------------
+      - name: Bump BSL Change Date
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f LICENSE ]] || ! grep -q '^Change Date:' LICENSE; then
+            echo "No LICENSE / no 'Change Date:' line - not BSL, skipping."
+            exit 0
+          fi
+
+          old="$(grep -m1 '^Change Date:' LICENSE | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')"
+          new="$(date -u -d "+4 years" +%Y-%m-%d)"
+
+          if [[ "$old" == "$new" ]]; then
+            echo "Change Date already $new, nothing to do."
+            exit 0
+          fi
+
+          # Only LICENSE and a top-level README are rewritten. Deliberately NOT
+          # a tree-wide search-and-replace: a CHANGELOG that records "Change
+          # Date set to <old date>" is stating history, and rewriting that would
+          # silently falsify the record. Add paths here if some other file
+          # restates the date as a live value rather than as history.
+          targets=(LICENSE)
+          for f in README.md README.rst README.txt README; do
+            [[ -f "$f" ]] && targets+=("$f")
+          done
+          sed -i "s/$old/$new/g" "${targets[@]}"
+
+          # Bump the copyright year if it is stale, without touching anything
+          # else on that line.
+          current_year="$(date -u +%Y)"
+          sed -i -E "s/(is \(c\) )[0-9]{4}/\1$current_year/" LICENSE
+
+          # Verify the LICENSE line actually changed. A silent no-op here would
+          # publish an archive still claiming the old date.
+          if grep -q -- "$old" LICENSE; then
+            echo "::error::Old Change Date $old still present in LICENSE after replacement - stopping before commit."
+            exit 1
+          fi
+
+          echo "Change Date: $old -> $new (files: ${targets[*]})"
+
+      # -----------------------------------------------------------------------
+      # Version constant. OPTIONAL and off by default: set VERSION_FILE and
+      # VERSION_PATTERN to the file and sed pattern for your project's version
+      # constant, and the tag's version will be stamped into it. Left empty,
+      # this step does nothing.
+      #
+      # Example for a PowerShell project with $script:AppVersion = '1.2.3'
+      # in lib/Logging.ps1:
+      #   VERSION_FILE: lib/Logging.ps1
+      #   VERSION_PATTERN: ^\$script:AppVersion = '[0-9]+\.[0-9]+\.[0-9]+'
+      #   VERSION_REPLACE: $script:AppVersion = 'VERSION'
+      # -----------------------------------------------------------------------
+      - name: Bump version constant
+        env:
+          VERSION_FILE: ''
+          VERSION_PATTERN: ''
+          VERSION_REPLACE: ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.resolve.outputs.tag }}"
+          version="${tag#v}"
+
+          if [[ -z "$VERSION_FILE" ]]; then
+            echo "No VERSION_FILE configured - skipping."
+            exit 0
+          fi
+          if [[ ! -f "$VERSION_FILE" ]]; then
+            echo "::error::VERSION_FILE '$VERSION_FILE' does not exist."
+            exit 1
+          fi
+
+          # VERSION in the replacement string stands in for the tag's version.
+          replace="${VERSION_REPLACE//VERSION/$version}"
+          sed -i -E "s|$VERSION_PATTERN|$replace|" "$VERSION_FILE"
+
+          if ! grep -qF -- "$replace" "$VERSION_FILE"; then
+            echo "::error::Version replacement in $VERSION_FILE did not verify."
+            exit 1
+          fi
+          echo "Version constant -> $version"
+
+      - name: Commit and move tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.resolve.outputs.tag }}"
+
+          # Nothing stamped (the common case for a non-BSL repo) means there is
+          # no commit to make and the tag already points where it should.
+          if git diff --quiet; then
+            echo "No metadata changes, leaving tag as-is."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -u
+          git commit -m "Release $tag: stamp release metadata"
+          git push origin HEAD:"${{ github.event.repository.default_branch }}"
+          git tag -f "$tag"
+          git push --force origin "refs/tags/$tag"
+
+  # ===========================================================================
+  # BUILD: runs once per OS in the matrix, produces files under dist/.
+  #
+  # Split from the release job on purpose. On the default path it costs about
+  # 15 seconds of artifact upload/download round-trip, which buys nothing by
+  # itself. It is what makes the OS matrix work the moment you uncomment a
+  # second OS: several build legs, one release. Merging the two jobs would mean
+  # rewriting this file to add a platform.
+  # ===========================================================================
+  build:
+    name: Build (${{ matrix.os }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Default is Linux only: the source bundle is platform-agnostic, so one
+        # runner is enough. Uncomment an OS below only when you have also
+        # uncommented a language block that produces per-platform binaries.
+        os:
+          - ubuntu-latest
+          # - macos-latest      # arm64 Mac (macos-26)
+          # - macos-26-intel    # x64 Intel Mac
+          # - windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          # refs/tags/<tag> rather than github.ref or the dispatch input
+          # directly: the prepare job may have force-moved this tag onto an
+          # amended commit, and this always resolves to wherever it points
+          # *now* (checkout fetches fresh from the remote).
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          # Depth 1 is deliberate, do not "fix" this back to 0. `git archive
+          # HEAD` only reads the tagged tree, and generate_release_notes below
+          # is computed server-side by the GitHub API, not from local history.
+          # Full history bought nothing here and only slowed the clone.
+          fetch-depth: 1
+
+      - name: Bundle source archives
+        # Guard: with a single-OS matrix this always runs. If you uncomment
+        # extra OSes above, git archive would produce a byte-identical file on
+        # each one and the release step would then try to upload several files
+        # with the same name. This pins the bundle to the Linux leg so that
+        # cannot happen.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.prepare.outputs.tag }}"
+          # Strip a leading dot from the repo name (e.g. ".github-private"):
+          # otherwise the archive filename below becomes a dotfile, which
+          # `ls -l` hides and actions/upload-artifact's glob silently skips.
+          repo_name="${{ github.event.repository.name }}"
+          repo_name="${repo_name#.}"
+          # Top-level folder inside each archive, e.g. myrepo-v0.1.0/
+          name="${repo_name}-${tag}"
+          mkdir -p dist
+          # git archive snapshots exactly the tagged commit. It honors the
+          # export-ignore rules in .gitattributes and never includes .git/.
+          git archive --format=tar.gz --prefix="${name}/" -o "dist/${name}.tar.gz" HEAD
+          git archive --format=zip    --prefix="${name}/" -o "dist/${name}.zip"    HEAD
+          ls -la dist
+
+      # =======================================================================
+      # === EDIT THIS SECTION (1/2): language toolchain setup ================
+      # =======================================================================
+      # Optional. Uncomment ONE block matching your language. Whatever you
+      # uncomment runs IN ADDITION to the source bundle above, and its output
+      # lands in the same Release. Nothing above needs to be removed.
+
+      # --- Go ---
+      # - name: Set up Go
+      #   uses: actions/setup-go@v5
+      #   with:
+      #     go-version: '1.22'
+
+      # --- Node / TypeScript ---
+      # - name: Set up Node
+      #   uses: actions/setup-node@v4
+      #   with:
+      #     node-version: '20'
+      #     cache: 'npm'
+
+      # --- Python ---
+      # - name: Set up Python
+      #   uses: actions/setup-python@v5
+      #   with:
+      #     python-version: '3.12'
+
+      # --- Rust ---
+      # - name: Set up Rust
+      #   uses: dtolnay/rust-toolchain@stable
+
+      # --- Java (Temurin / Gradle) ---
+      # - name: Set up JDK
+      #   uses: actions/setup-java@v4
+      #   with:
+      #     distribution: 'temurin'
+      #     java-version: '21'
+
+      # --- Shell / PowerShell / no compilation needed ---
+      # Nothing to do. The source bundle step above already ships your scripts.
+
+      # =======================================================================
+      # === EDIT THIS SECTION (2/2): build command ===========================
+      # =======================================================================
+      # Uncomment the block matching the toolchain you set up above. Adjust the
+      # binary name and paths for your project. Everything must land in dist/.
+
+      # --- Go ---
+      # - name: Build binary
+      #   shell: bash
+      #   run: |
+      #     mkdir -p dist
+      #     ext=""; [[ "$RUNNER_OS" == "Windows" ]] && ext=".exe"
+      #     # Replace "myapp" with your binary name; replace "./..." with your main package.
+      #     go build -o "dist/myapp-${{ runner.os }}-${{ runner.arch }}${ext}" ./...
+
+      # --- Node / TypeScript ---
+      # - name: Build and package
+      #   shell: bash
+      #   run: |
+      #     npm ci
+      #     npm run build
+      #     mkdir -p dist
+      #     # runner.os in the name keeps multi-OS matrix uploads from colliding.
+      #     tar -czf "dist/${{ github.event.repository.name }}-${{ runner.os }}.tar.gz" -C build .
+
+      # --- Python ---
+      # - name: Build wheel and sdist
+      #   run: |
+      #     python -m pip install --upgrade pip build
+      #     python -m build
+      #     # produces dist/*.whl and dist/*.tar.gz
+      #     # NOTE: wheel/sdist filenames are fixed by PEP 427/440 and must not be
+      #     # renamed. For a pure-Python package, leave the OS matrix on
+      #     # ubuntu-latest only; otherwise every OS leg builds an identically
+      #     # named file and the release step fails on the second one.
+
+      # --- Rust ---
+      # - name: Build binary
+      #   shell: bash
+      #   run: |
+      #     cargo build --release
+      #     mkdir -p dist
+      #     ext=""; [[ "$RUNNER_OS" == "Windows" ]] && ext=".exe"
+      #     # Replace "myapp" with your binary name (must match Cargo.toml [[bin]] or package name).
+      #     cp "target/release/myapp${ext}" "dist/myapp-${{ runner.os }}-${{ runner.arch }}${ext}"
+
+      # --- Java (Gradle) ---
+      # - name: Build jar
+      #   run: ./gradlew build
+      # - name: Stage artifacts
+      #   shell: bash
+      #   run: |
+      #     mkdir -p dist
+      #     # A plain JAR is identical across OS runners. Without a per-OS name here,
+      #     # the release step fails once two matrix legs produce the same filename.
+      #     # If the JAR has no native/JNI code, the better fix is leaving the OS
+      #     # matrix on ubuntu-latest only and dropping this loop entirely.
+      #     for f in build/libs/*.jar; do
+      #       base="$(basename "$f" .jar)"
+      #       cp "$f" "dist/${base}-${{ runner.os }}.jar"
+      #     done
+
+      # =======================================================================
+      # Upload artifacts (no edits needed below)
+      # =======================================================================
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.os }}
+          path: |
+            dist/**
+          # Fail loudly if a leg produced nothing. On a non-Linux leg with no
+          # language block uncommented this is the expected outcome, which is
+          # why extra OSes stay commented until you actually build something.
+          if-no-files-found: error
+          retention-days: 7
+
+  # ===========================================================================
+  # RELEASE: pulls every artifact from the build matrix and creates the Release.
+  # ===========================================================================
+  release:
+    name: Create GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+
+    # Scoped elevation: this job needs write access to publish.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: List artifacts (debug)
+        shell: bash
+        run: |
+          echo "Artifacts ready to upload:"
+          find artifacts -type f -printf "  %p (%s bytes)\n" 2>/dev/null || ls -lR artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          # GitHub auto-generates notes from PRs/commits since the previous tag.
+          generate_release_notes: true
+          # Attach every file produced by the build job.
+          files: artifacts/**/*
+          # Fail if the glob matches nothing, so a broken build cannot publish an
+          # empty release.
+          fail_on_unmatched_files: true
