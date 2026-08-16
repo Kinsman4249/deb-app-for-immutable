@@ -106,7 +106,7 @@ Push a tag matching `vX.Y.Z` to `main` (`git tag -a vX.Y.Z -m "Release vX.Y.Z" &
 
 ## License
 
-See [LICENSE](<REPO_URL>/blob/main/LICENSE).
+See [LICENSE](https://github.com/Kinsman4249/deb-app-for-immutable/blob/main/LICENSE).
 
 ## Community
 
