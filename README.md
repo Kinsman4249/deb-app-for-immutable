@@ -50,44 +50,64 @@ cd deb-app-for-immutable
 Run from a host desktop terminal:
 
 ```
-./install-deb.sh ~/Downloads/splashtop.deb      # install .deb + export its apps
-./install-deb.sh --name splashtop ~/Downloads/splashtop.deb   # export one entry only
-./uninstall-app.sh --app splashtop              # remove an app's host launcher
-./uninstall-app.sh --list                        # what has been exported
-./uninstall-app.sh --package deb-name           # also apt-remove the package
-distrobox rm deb-apps                            # remove the whole container
+./install-deb.sh --target ~/Downloads/splashtop.tar.gz   # tarball bundling a .deb
+./install-deb.sh --target ~/Downloads/app.deb             # plain .deb
+./install-deb.sh --target a.deb --target b.tar.gz         # several apps, one container
+./install-deb.sh --target app.deb --name APP              # export one entry only
+./uninstall-app.sh --list                                  # query what's installed
+./uninstall-app.sh --remove APP                            # unexport + purge that app
+./uninstall-app.sh --app APP                               # unexport only (keep pkg)
+distrobox rm deb-apps                                      # remove the whole container
 ```
 
-`install-deb.sh` copies the `.deb` into a staging dir under `~/.local/state`,
-installs it inside the container (resolving dependencies with `gdebi`), diffs
-the container's `/usr/share/applications` before/after, and runs
-`distrobox-export --app` for each newly added entry. That writes a launcher and
-`.desktop` file to your host `~/.local/share/applications` whose `Exec` line
-runs `distrobox enter deb-apps -- <app>`, so the app appears in the app grid
-and opens like a native app. A state file under `~/.config/deb-apps/exported`
-tracks what the project created so `uninstall-app.sh` can remove exactly that.
+`install-deb.sh --target PATH` installs each target's `.deb` into a shared
+Debian container and exports the desktop entries it ships to the host app grid.
+Each target is auto-detected as a plain `.deb` or a bundled `.tar.gz` (the format
+some Debian apps publish in). The `.deb` is installed inside the container with
+dependency resolution, under a systemctl shim so packages whose `postinst` calls
+`systemctl` still work in the no-systemd box. The container's desktop set is
+diffed before/after, hidden entries (`NoDisplay`/`Hidden`) are skipped by
+default, and each newly added entry is exported with `distrobox-export`, which
+plants a launcher + `.desktop` file on your host (whose `Exec` runs the app via
+`distrobox enter`). Icons are re-installed into the host icon theme so they show
+up in taskbars/docks, not just the app grid.
+
+A manifest under `~/.config/deb-apps/manifest.tsv` records each exported entry
+(package name, desktop base, container), so `uninstall-app.sh` can query and
+remove one app atomically without touching the box or the other apps. No
+downloads happen here - you supply the artifact.
 
 ## Configuration
 
 - Container name and image: `--container NAME` and `--image IMAGE` on
-  `install-deb.sh`. The name (default `deb-apps`) is stored per-run; pass the
-  same `--container` to `uninstall-app.sh`. Multiple containers let you keep
-  apps isolated from each other.
+  `install-deb.sh`. The name (default `deb-apps`) is stored in the manifest;
+  pass the same `--container` to `uninstall-app.sh`. Multiple containers let
+  you keep apps isolated from each other.
 - `--name APP` narrows an install to export only the matching desktop entry
   (a filename or extension-less app name), for `.deb`s that ship several
   launchers you don't all want.
+- `--gpu` / `--no-gpu` force/disable GPU handling; auto-detection is the
+  default (distrobox already shares `/dev/dri`; `--nvidia` is only added at
+  container-create time when an NVIDIA device is detected).
+- `--wizard` forces instructive prompts when an install is ambiguous
+  (a tar with several `.deb`s, multiple visible desktop entries). Without it,
+  prompts only fire when stdin is a TTY; in CI (`--non-interactive` or no TTY)
+  the script picks the safest default and logs a `Note:` instead of hanging.
+- `--app-args "..."` is accepted as a documented passthrough for per-app launch
+  flags; the generated launcher does not inject extra args by default.
 - `--debug` prints every command; `--help` prints usage.
 
 ## Development
 
-Three shell scripts: `install-deb.sh` and `uninstall-app.sh` run on the host,
-and `provision-container.sh` is piped into the container by `install-deb.sh`.
+Four shell scripts: `install-deb.sh` and `uninstall-app.sh` run on the host,
+`lib-auto.sh` is the host-side helper library they source, and
+`provision-container.sh` is piped into the container by `install-deb.sh`.
 All lint clean with shellcheck (which this repo doesn't vendor; install it
 if you want to re-run):
 
 ```
-bash -n install-deb.sh provision-container.sh uninstall-app.sh
-shellcheck install-deb.sh provision-container.sh uninstall-app.sh
+bash -n install-deb.sh uninstall-app.sh lib-auto.sh provision-container.sh
+shellcheck install-deb.sh uninstall-app.sh lib-auto.sh provision-container.sh
 ```
 
 End-to-end check against a real `.deb`: run `install-deb.sh` with a small

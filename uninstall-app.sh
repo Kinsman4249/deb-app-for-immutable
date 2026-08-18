@@ -1,42 +1,39 @@
 #!/usr/bin/env bash
 #
-# Removes an app installed by install-deb.sh.
+# Removes an app installed by install-deb.sh and queries what's installed.
 #
-# What it removes:
-#   - the exported host launcher + .desktop entry for the app (via
-#     distrobox-export --delete), so it leaves the host app grid;
-#   - the deb package itself inside the container, if --package NAME is given
-#     (otherwise the .deb stays installed, just unexported - default).
-#
-# The container itself is left in place so other installed apps keep working.
-# To tear down the whole container instead, run `distrobox rm deb-apps` and
-# `./uninstall-app.sh --all`-style cleanup is intentionally not automatic.
+# install-deb.sh records each exported desktop entry in a manifest
+# (~/.config/deb-apps/manifest.tsv, one tab-separated row per entry:
+# desktop_base<TAB>package_name<TAB>container). This script reads that manifest
+# so it can query the installed apps and remove one app atomically without
+# touching the shared container or the other apps in it.
 #
 # Usage:
-#   ./uninstall-app.sh --app NAME            unexport an app by desktop filename
-#                                             or app name (e.g. splashtop)
-#   ./uninstall-app.sh --package PKG         also `apt-get remove` PKG in the container
-#   ./uninstall-app.sh --container NAME      container to act on (default deb-apps)
-#   ./uninstall-app.sh --list                list apps this project has exported
-#   ./uninstall-app.sh --debug               print every command run
-#   ./uninstall-app.sh --help                show this help
+#   ./uninstall-app.sh --list                  query: show every installed app
+#   ./uninstall-app.sh --query                 (same as --list)
+#   ./uninstall-app.sh --remove APP            default: unexport + purge that app
+#   ./uninstall-app.sh --app NAME              unexport only (leave package)
+#   ./uninstall-app.sh --container NAME        container to act on (default deb-apps)
+#   ./uninstall-app.sh --debug                 print every command run
+#   ./uninstall-app.sh --help                  show this help
 #
 set -euo pipefail
 
-BUILD="2026.08.16-1"
+BUILD="2026.08.17-1"
 
-CONTAINER_NAME="deb-apps"
-APP_NAME=""
-PACKAGE=""
 DO_LIST=0
+DO_REMOVE=""
+APP_NAME=""
 DEBUG=0
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/${CONTAINER_NAME}"
-EXPORTED_FILE="${CONFIG_DIR}/exported"
+# Source the shared host-side library for CONTAINER_NAME/CONFIG_DIR/manifest
+# paths + the systemctl-aware purge shim derivation.
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-auto.sh"
 
-die() {
-  echo "Error: $*" >&2
-  exit 1
+usage() {
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
 }
 
 while [ $# -gt 0 ]; do
@@ -45,23 +42,19 @@ while [ $# -gt 0 ]; do
       DEBUG=1
       shift
       ;;
+    --list|--query)
+      DO_LIST=1
+      shift
+      ;;
+    --remove)
+      DO_REMOVE="${2:-}"
+      [ -n "$DO_REMOVE" ] || die "--remove requires an app name or package name."
+      shift 2
+      ;;
     --app)
       APP_NAME="${2:-}"
       [ -n "$APP_NAME" ] || die "--app requires a name."
       shift 2
-      ;;
-    --app=*)
-      APP_NAME="${1#*=}"
-      shift
-      ;;
-    --package)
-      PACKAGE="${2:-}"
-      [ -n "$PACKAGE" ] || die "--package requires a package name."
-      shift 2
-      ;;
-    --package=*)
-      PACKAGE="${1#*=}"
-      shift
       ;;
     --container)
       CONTAINER_NAME="${2:-}"
@@ -72,13 +65,8 @@ while [ $# -gt 0 ]; do
       CONTAINER_NAME="${1#*=}"
       shift
       ;;
-    --list)
-      DO_LIST=1
-      shift
-      ;;
     -h|--help)
-      sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
-      exit 0
+      usage
       ;;
     *)
       die "Unknown option: $1 (use --help)"
@@ -91,94 +79,187 @@ if [ "$DEBUG" -eq 1 ]; then
   set -x
 fi
 
-require_host() {
-  if [ -f /run/.containerenv ] || [ -f /.dockerenv ] || [ -n "${container:-}" ]; then
-    die "this looks like it's running inside a container. Run it from a host terminal instead."
-  fi
-  command -v distrobox >/dev/null 2>&1 \
-    || die "distrobox is not installed or not on PATH."
+require_host
+
+# --- Manifest helpers ------------------------------------------------------
+
+manifest_exists() {
+  [ -s "$MANIFEST" ]
 }
 
-container_exists() {
-  distrobox list 2>/dev/null | awk '{print $1}' | grep -qx "$CONTAINER_NAME"
+# rows APP -> prints "desktop_base<TAB>container" for every row matching APP by
+# package name OR desktop stem (codium, codium.desktop, splashtop-business...).
+rows() {
+  local app="$1" base pkg ctn
+  [ "$DO_LIST" -eq 1 ] && return 0
+  while IFS=$'\t' read -r base pkg ctn; do
+    [ -n "$base" ] || continue
+    if [ "$pkg" = "$app" ] || [ "${base%.desktop}" = "${app%.desktop}" ] \
+       || [ "$base" = "$app" ]; then
+      printf '%s\t%s\n' "$base" "$ctn"
+    fi
+  done < "$MANIFEST"
 }
 
-list_exported() {
-  if [ -f "$EXPORTED_FILE" ]; then
-    sort -u "$EXPORTED_FILE"
+# --- Query ----------------------------------------------------------------
+
+list_apps() {
+  local base pkg ctn current=""
+  if ! manifest_exists; then
+    echo "Nothing installed yet (no manifest at $MANIFEST)."
+    return 0
   fi
+  echo "Apps installed via $CONTAINER_NAME:"
+  while IFS=$'\t' read -r base pkg ctn; do
+    [ -n "$base" ] || continue
+    if [ "$pkg" != "$current" ]; then
+      current="$pkg"
+      echo
+      printf '  %s (container: %s)\n' "$pkg" "$ctn"
+    fi
+    printf '    - %s\n' "$base"
+  done < <(sort -u "$MANIFEST")
+  echo
+  echo "Remove one with: ./uninstall-app.sh --remove <app-or-package>"
+  echo "To remove the whole container: distrobox rm $CONTAINER_NAME"
 }
+
+# --- Unexport -------------------------------------------------------------
 
 do_unexport() {
-  local name="${1%.desktop}"
-  # Tell distrobox-export exactly which .desktop file to drop from the host.
-  # If it is not present in the container there is nothing else to unexport, but
-  # a stale host entry may still exist - so also remove any planted launcher.
-  if distrobox enter "$CONTAINER_NAME" -- \
-      test -f "/usr/share/applications/${name}.desktop"; then
+  local base="$1" name="${1%.desktop}" desktop_path
+  desktop_path="$(locate_desktop "$base" 2>/dev/null || true)"
+  if [ -n "$desktop_path" ]; then
     distrobox enter "$CONTAINER_NAME" -- distrobox-export \
-      --app "$name" --desktop-file "/usr/share/applications/${name}.desktop" --delete
-  elif distrobox enter "$CONTAINER_NAME" -- \
-      test -f "\$HOME/.local/share/applications/${name}.desktop"; then
-    local home_path
-    home_path="$(distrobox enter "$CONTAINER_NAME" -- printf '%s' "\$HOME/.local/share/applications/${name}.desktop")"
-    distrobox enter "$CONTAINER_NAME" -- distrobox-export \
-      --app "$name" --desktop-file "$home_path" --delete
+      --app "$desktop_path" --delete \
+      || echo "Warning: could not unexport $name. See distrobox's error above."
   else
-    echo "Note: ${name}.desktop not found in the container - removing any stale host launcher."
+    echo "Note: $base not found in the container - removing any stale host launcher."
     rm -f "$HOME/.local/bin/${name}" \
-      "$HOME/.local/share/applications/${name}.desktop"
+      "$HOME/.local/share/applications/${name}.desktop" \
+      "${HOST_APPS_DIR}/$(export_label)-${name}.desktop" 2>/dev/null || true
   fi
-  # Drop it from the state file so a later --list is accurate.
+  rm -f "$HOME/.local/share/icons/${name}.png" \
+    "${HOST_APPS_DIR}/$(export_label)-${name}.desktop" 2>/dev/null || true
+}
+
+# do_unexport_by_app APP: unexport every manifest entry matching APP (no purge).
+do_unexport_by_app() {
+  local app="$1" base ctn
+  while IFS=$'\t' read -r base ctn; do
+    [ -n "$base" ] || continue
+    do_unexport "$base"
+  done < <(rows "$app") || true
+}
+
+# --- Purge under the systemctl shim ---------------------------------------
+#
+# A package's prerm/postrm can call `systemctl`, which fails in the no-systemd
+# box just like an install's postinst does - so purge runs under the same
+# dpkg-divert shim that provision-container.sh uses, via a tiny piped script.
+purge_package() {
+  local pkg="$1"
+  echo "Purging package '$pkg' inside $CONTAINER_NAME (with systemctl shim)..."
+  export BOX_DEBUG="$DEBUG"
+  distrobox enter "$CONTAINER_NAME" -- bash -s -- "$pkg" <<'PURGE'
+set -euo pipefail
+PKG="$1"
+SHIMMED=0
+cleanup() {
+  if [ "$SHIMMED" -eq 1 ]; then
+    sudo rm -f /usr/bin/systemctl
+    sudo dpkg-divert --local --rename --remove /usr/bin/systemctl >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+if ! systemctl daemon-reload >/dev/null 2>&1; then
+  echo "Neutralizing systemctl for the purge..."
+  sudo dpkg-divert --local --rename --divert /usr/bin/systemctl.real --add /usr/bin/systemctl >/dev/null
+  sudo ln -sf /bin/true /usr/bin/systemctl
+  SHIMMED=1
+fi
+sudo apt-get purge -y "$PKG" || echo "Warning: apt purge reported a problem (may be a partial state)."
+PURGE
+}
+
+# --- Remove (default: unexport + purge) -----------------------------------
+
+do_remove() {
+  local app="$1" base ctn
+  local -a targets=()
+  manifest_exists || die "nothing recorded in the manifest at $MANIFEST - nothing to remove."
+  while IFS=$'\t' read -r base ctn; do
+    targets+=("$base|$ctn")
+  done < <(rows "$app")
+  if [ "${#targets[@]}" -eq 0 ]; then
+    die "no manifest entry matched '$app'. Run --list to see what's installed."
+  fi
+  local base t cached_pkg=""
+  for t in "${targets[@]}"; do
+    base="${t%%|*}"
+    [ -z "$cached_pkg" ] && cached_pkg="$(pkg_for "$base")"
+    do_unexport "$base"
+  done
+  if [ -n "$cached_pkg" ] && [ "$cached_pkg" != "unknown" ]; then
+    purge_package "$cached_pkg"
+  fi
+  # Drop this app's rows from the manifest (by matching desktop stem) and drop
+  # its entries from the legacy flat exported file.
   local tmp
   tmp="$(mktemp)"
-  grep -vxF "${name}.desktop" "$EXPORTED_FILE" > "$tmp" 2>/dev/null || true
-  mv "$tmp" "$EXPORTED_FILE" 2>/dev/null || rm -f "$EXPORTED_FILE"
-}
-
-do_purge() {
-  echo "Removing package '$PACKAGE' inside $CONTAINER_NAME..."
-  distrobox enter "$CONTAINER_NAME" -- sudo apt-get remove -y "$PACKAGE" \
-    || echo "Warning: apt remove reported a problem (it may not be installed)."
-}
-
-refresh_desktop_db() {
-  if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
+  while IFS=$'\t' read -r base2 pkg2 ctn2; do
+    # shellcheck disable=SC2046
+    if [ "$pkg2" != "$cached_pkg" ] && [ "${base2%.desktop}" != "${app%.desktop}" ]; then
+      printf '%s\t%s\t%s\n' "$base2" "$pkg2" "$ctn2"
+    fi
+  done < "$MANIFEST" > "$tmp" || true
+  mv "$tmp" "$MANIFEST"
+  if [ -f "$EXPORTED_FILE" ]; then
+    tmp="$(mktemp)"
+    grep -vxF "${base%.desktop}.desktop" "$EXPORTED_FILE" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$EXPORTED_FILE"
+  fi
+  refresh_desktop_db
+  echo "Removed '$app'."
+  if manifest_exists; then
+    echo "Other apps remain installed; the container '$CONTAINER_NAME' is untouched."
+  else
+    echo "No apps remain. To remove the container: distrobox rm $CONTAINER_NAME"
   fi
 }
+
+# pkg_for DESKTOP_BASE -> the package name recorded for that entry, if any.
+pkg_for() {
+  local base="$1" b p
+  while IFS=$'\t' read -r b p _; do
+    if [ "$b" = "$base" ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done < "$MANIFEST"
+  printf 'unknown\n'
+}
+
+# --- Entry ----------------------------------------------------------------
 
 if [ "$DO_LIST" -eq 1 ]; then
-  require_host
-  echo "Apps exported by $CONTAINER_NAME (from $EXPORTED_FILE):"
-  if [ -s "$EXPORTED_FILE" ]; then
-    list_exported
-  else
-    echo "  (none recorded)"
-  fi
+  list_apps
   exit 0
 fi
 
-if [ -z "$APP_NAME" ] && [ -z "$PACKAGE" ]; then
-  die "nothing to do. Pass --app NAME and/or --package PKG, or --list."
+if [ -z "$DO_REMOVE" ] && [ -z "$APP_NAME" ]; then
+  die "nothing to do. Pass --remove APP, --app NAME, or --list."
 fi
 
-require_host
 container_exists || die "container '$CONTAINER_NAME' does not exist. Nothing to uninstall."
 
 if [ -n "$APP_NAME" ]; then
-  do_unexport "$APP_NAME"
-fi
-if [ -n "$PACKAGE" ]; then
-  do_purge
+  # --app NAME: unexport only (no purge).
+  do_unexport_by_app "$APP_NAME"
+  refresh_desktop_db
+  echo "Done. Unexported '$APP_NAME' (package left installed)."
 fi
 
-refresh_desktop_db
-echo "Done."
-
-# If the state file is now empty, there is nothing left this project manages;
-# hint at how to drop the container itself.
-if [ ! -s "$EXPORTED_FILE" ]; then
-  echo "No exported launchers remain for '$CONTAINER_NAME'. To remove the container"
-  echo "itself, run:  distrobox rm $CONTAINER_NAME"
+if [ -n "$DO_REMOVE" ]; then
+  do_remove "$DO_REMOVE"
 fi
