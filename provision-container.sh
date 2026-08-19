@@ -9,9 +9,11 @@
 # privileged operations go through 'sudo'. gdebi-core is guaranteed present
 # because install-deb.sh passes it to `distrobox create --additional-packages`.
 #
-# $1 = absolute path to the .deb, inside the container (distrobox mounts host
-#      $HOME at the same path, so the staged file in ~/.local/state is visible
-#      here at an identical path).
+# $1 = either an absolute path to the .deb, inside the container (distrobox
+#      mounts host $HOME at the same path, so the staged file in
+#      ~/.local/state is visible here at an identical path), or "apt:<pkgs>"
+#      to install package(s) from the Debian repos (an `--target "apt install
+#      P"` request).
 #
 # After installing, it prints a machine-parseable FACTS block on stdout so the
 # host side knows the package name, whether the systemctl shim was active, and
@@ -27,7 +29,7 @@
 #
 set -euo pipefail
 
-BUILD="2026.08.17-1"
+BUILD="2026.08.18-2"
 
 # install-deb.sh exports BOX_DEBUG=1/0 to honour its --debug flag.
 if [ "${BOX_DEBUG:-0}" = "1" ]; then
@@ -35,10 +37,36 @@ if [ "${BOX_DEBUG:-0}" = "1" ]; then
   set -x
 fi
 
-DEB_PATH="${1:-}"
-if [ -z "$DEB_PATH" ] || [ ! -f "$DEB_PATH" ]; then
-  echo "Error: provision-container.sh expects the container path to a .deb as argv[1]." >&2
-  exit 1
+ARG="${1:-}"
+MODE=deb
+DEB_PATH=""
+APT_PACKAGES=""
+case "$ARG" in
+  apt:*)
+    MODE=apt
+    APT_PACKAGES="${ARG#apt:}"
+    ;;
+  *)
+    DEB_PATH="$ARG"
+    ;;
+esac
+
+if [ "$MODE" = deb ]; then
+  if [ -z "$DEB_PATH" ] || [ ! -f "$DEB_PATH" ]; then
+    echo "Error: provision-container.sh expects the container path to a .deb as argv[1]," >&2
+    echo "       or an 'apt:<packages>' target." >&2
+    exit 1
+  fi
+else
+  # shellcheck disable=SC2086 # APT_PACKAGES is a word-split package list below.
+  set -- $APT_PACKAGES
+  if [ $# -eq 0 ]; then
+    echo "Error: 'apt:' target had no package names." >&2
+    exit 1
+  fi
+  # First requested package is the manifest's package column (fine for one or
+  # several packages installed from a single target).
+  PKG="$1"
 fi
 
 export DEBIAN_FRONTEND=noninteractive
@@ -72,16 +100,23 @@ fi
 echo "Updating package lists..."
 sudo apt-get update -qq
 
-echo "Installing $(basename "$DEB_PATH")..."
-# gdebi resolves the package's dependencies from the apt repos and installs
-# them alongside the .deb - the reason it is the install path rather than raw
-# dpkg. --non-interactive means it never prompts, which is what is wanted when
-# a script drives it.
-if sudo -n true 2>/dev/null; then
-  sudo gdebi --non-interactive --quiet "$DEB_PATH"
+if [ "$MODE" = deb ]; then
+  echo "Installing $(basename "$DEB_PATH")..."
+  # gdebi resolves the package's dependencies from the apt repos and installs
+  # them alongside the .deb - the reason it is the install path rather than raw
+  # dpkg. --non-interactive means it never prompts, which is what is wanted when
+  # a script drives it.
+  if sudo -n true 2>/dev/null; then
+    sudo gdebi --non-interactive --quiet "$DEB_PATH"
+  else
+    echo "Note: passwordless sudo unavailable - trying apt dependency resolution directly."
+    sudo apt-get install -y "$DEB_PATH"
+  fi
 else
-  echo "Note: passwordless sudo unavailable - trying apt dependency resolution directly."
-  sudo apt-get install -y "$DEB_PATH"
+  echo "Installing from apt: $APT_PACKAGES"
+  # shellcheck disable=SC2086 # intended word-split package list; apt pulls
+  # Recommends just like the gdebi .deb path, so e.g. `vlc` gets its codecs.
+  sudo apt-get install -y $APT_PACKAGES
 fi
 
 # Some vendor .debs omit a runtime library from Depends (splashtop relies on
@@ -118,11 +153,10 @@ so_to_pkg() {
 }
 
 fix_missing_libs() {
-  local bin so pkg missing=0
+  local bin so pkg
   while IFS= read -r bin; do
     [ -n "$bin" ] || continue
     while IFS= read -r so; do
-      missing=1
       pkg="$(so_to_pkg "$so")"
       [ -n "$pkg" ] || continue
       if apt-cache show "$pkg" >/dev/null 2>&1; then
@@ -133,7 +167,12 @@ fix_missing_libs() {
       fi
     done < <(ldd "$bin" 2>/dev/null | awk '/not found/{print $1}')
   done < <(find_app_bins)
-  [ "$missing" -eq 1 ]
+  # Always return success: this is a best-effort repair pass, and under
+  # `set -e` a non-zero return here (e.g. nothing was missing) would abort the
+  # whole provision after the package already installed but before the FACTS
+  # block is emitted, leaving the app installed but not exported and the host
+  # seeing a silent failure.
+  return 0
 }
 fix_missing_libs
 
@@ -141,8 +180,11 @@ fix_missing_libs
 # immutable Fedora and has no dpkg, but this runs in Debian, where dpkg-deb is
 # always present - this is the authoritative source for the manifest's package
 # column. Multiple Package: fields do not happen for a real control file; the
-# last one wins if a corrupted deb sneaks through.
-PKG="$(dpkg-deb -f "$DEB_PATH" Package 2>/dev/null | tail -n1)"
+# last one wins if a corrupted deb sneaks through. (For an apt target, PKG was
+# already set to the first requested package above.)
+if [ "$MODE" = deb ]; then
+  PKG="$(dpkg-deb -f "$DEB_PATH" Package 2>/dev/null | tail -n1)"
+fi
 
 emit_facts() {
   echo "##DEBAPP_FACTS"
@@ -160,5 +202,10 @@ emit_facts() {
 
 emit_facts
 
-echo "Installed $(basename "$DEB_PATH"). Its desktop entries were exported to the"
-echo "host app grid by install-deb.sh."
+if [ "$MODE" = deb ]; then
+  echo "Installed $(basename "$DEB_PATH"). Its desktop entries were exported to the"
+  echo "host app grid by install-deb.sh."
+else
+  echo "Installed $APT_PACKAGES from apt. install-deb.sh exported any GUI launchers"
+  echo "it provides, or offered the CLI binaries for host PATH export."
+fi

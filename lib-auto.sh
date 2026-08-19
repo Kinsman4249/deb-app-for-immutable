@@ -6,10 +6,13 @@
 # well under ~500 lines. Everything here runs on the HOST:
 #
 #   - target classification + tarball bundling (classify_target / bundle_tarball)
+#   - apt-package targets (is_apt_target / apt_packages): --target "apt install P"
 #   - staging a file so the shared $HOME mount makes it visible in the container
 #   - container ensure + GPU detection (ensure_container / detect_gpu)
 #   - desktop discovery, filtering and export (list_desktops / export_desktops)
 #   - icon detection + theme install (detect_icon / install_icon)
+#   - terminal-only binary export (offer_export_bins / _export_bin) shared by
+#     .deb, tarball and apt targets
 #   - the manifest recording each exported entry
 #   - wizard/prompt helpers with a CI-safe non-interactive path
 #
@@ -24,6 +27,11 @@ DEBUG="${DEBUG:-0}"
 APP_FILTER="${APP_FILTER:-}"
 WIZARD="${WIZARD:-0}"          # --wizard: force prompts
 NON_INTERACTIVE="${NON_INTERACTIVE:-0}"  # --non-interactive: never prompt
+
+# Set by export_desktops: 1 once a target exported a desktop launcher. Lets the
+# caller distinguish "terminal-only app, nothing to launch" from "GUI app
+# exported", so it can offer a --bin export instead.
+EXPORTED_ANY="${EXPORTED_ANY:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROVISION_SCRIPT="${SCRIPT_DIR}/provision-container.sh"
@@ -129,6 +137,31 @@ classify_target() {
       esac
       ;;
   esac
+}
+
+# is_apt_target TARGET -> returns 0 when TARGET should be handled as an in-box
+# `apt install` rather than a local artifact. Artifacts always win: an existing
+# file, or a path-like arg (`/...`, `./...`), is never an apt target. Anything
+# else (a bare package name / list, or an `apt install ...` / `apt-get install
+# ...` command) is treated as packages to install from the Debian repos.
+is_apt_target() {
+  local s="$1"
+  if [ -e "$s" ]; then
+    return 1
+  fi
+  case "$s" in
+    /*|./*|../*|~*) return 1 ;;
+  esac
+  # Trim whitespace, then require something to install.
+  s="$(printf '%s' "$s" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  [ -n "$s" ]
+}
+
+# apt_packages TARGET -> echoes just the package name(s) to install, stripping a
+# leading `apt install` / `apt-get install` wrapper if present.
+apt_packages() {
+  printf '%s\n' "$1" | sed -E \
+    's/^[[:space:]]*(apt(-get)?[[:space:]]+install[[:space:]]+)?//; s/[[:space:]]+$//'
 }
 
 bundle_tarball() {
@@ -274,6 +307,48 @@ is_hidden() {
   return 1
 }
 
+# desktop_is_terminal BASE -> returns 0 when the entry is a terminal-only app.
+#
+# "Terminal application only" means the app runs in a terminal and never opens
+# its own window, even though it may ship a `.desktop` for menu convenience
+# (htop does exactly this). We only ever downgrade a launcher on a POSITIVE
+# terminal signal - never downgrade a real GUI into a PATH command by mistake:
+#   - declarative: the entry has `Terminal=true` or a `ConsoleOnly` category;
+#   - empirical guard: IF such a flag is set, we still trust the binary over the
+#     metadata - if its Exec target links GUI toolkit libs (X11/XCB/Wayland/GTK/
+#     Qt/SDL/EGL/GL), it is actually a GUI app despite the flag.
+# An entry with no terminal flag keeps its launcher export (GUI or ambiguous).
+desktop_is_terminal() {
+  local base="$1" path exe
+  path="$(locate_desktop "$base" 2>/dev/null || true)"
+  [ -n "$path" ] || return 1
+  # No declarative terminal signal -> GUI/ambiguous -> keep the launcher.
+  # shellcheck disable=SC2016 # the sh -c body must run in the container.
+  if ! distrobox enter "$CONTAINER_NAME" -- sh -c \
+      "grep -qiE '^(Terminal=[Tt]rue|Categories=.*ConsoleOnly)' \"\$1\" 2>/dev/null" \
+      b "$path"; then
+    return 1
+  fi
+  # Exec binary; bare commands resolve to a path inside the container.
+  # shellcheck disable=SC2016 # the sh -c body must run in the container.
+  exe="$(distrobox enter "$CONTAINER_NAME" -- sh -c \
+      "sed -n -E 's/^Exec=([^ %]+).*/\\1/p' \"\$1\" | head -n1" b "$path" 2>/dev/null || true)"
+  case "$exe" in
+    '') return 0 ;;                       # flag set, no Exec -> treat as terminal
+    /*) ;;
+    *) exe="$(distrobox enter "$CONTAINER_NAME" -- command -v "$exe" 2>/dev/null || true)" ;;
+  esac
+  [ -n "$exe" ] || return 0
+  # Flag set but the binary actually links a GUI toolkit -> it IS a GUI app.
+  # shellcheck disable=SC2016 # the sh -c body must run in the container.
+  if distrobox enter "$CONTAINER_NAME" -- sh -c \
+      "ldd \"\$1\" 2>/dev/null | grep -qiE 'libX11|libxcb|wayland-client|libgtk|libQt|libSDL|libEGL|libGL'" \
+      b "$exe"; then
+    return 1
+  fi
+  return 0
+}
+
 locate_desktop() {
   local base="$1" path
   if distrobox enter "$CONTAINER_NAME" -- test -f "/usr/share/applications/$base"; then
@@ -292,6 +367,7 @@ locate_desktop() {
 # path to avoid guessing which location held the entry.
 export_desktops() {
   local base desktop_path export_name
+  EXPORTED_ANY=0
   mkdir -p "$CONFIG_DIR"
   for base in "$@"; do
     desktop_path="$(locate_desktop "$base")"
@@ -307,6 +383,7 @@ export_desktops() {
     printf '%s\n' "$base" >> "$EXPORTED_FILE"
     record_manifest "$base"
     install_icon "$export_name" "$desktop_path"
+    EXPORTED_ANY=1
   done
 }
 
@@ -321,12 +398,33 @@ record_manifest() {
   dedup_manifest
 }
 
+# record_manifest_bin NAME: record a terminal-only binary export the same way a
+# desktop entry is recorded, as a `bin:<name>` row so uninstall can resolve it.
+record_manifest_bin() {
+  local name="$1"
+  mkdir -p "$CONFIG_DIR"
+  printf 'bin:%s\t%s\t%s\n' "$name" "${FACTS_PACKAGE:-unknown}" "$CONTAINER_NAME" >> "$MANIFEST"
+  dedup_manifest
+}
+
 dedup_manifest() {
   [ -s "$MANIFEST" ] || return 0
   local tmp
   tmp="$(mktemp)"
   sort -u "$MANIFEST" > "$tmp"
   mv "$tmp" "$MANIFEST"
+}
+
+# manifest_has_pkg PACKAGE -> returns 0 if an app with that package name is
+# already recorded (desktop or bin row). Used so a re-run of an already-exported
+# app never re-offers a terminal-only bin export.
+manifest_has_pkg() {
+  local p="$1" b c _
+  [ -s "$MANIFEST" ] || return 1
+  while IFS=$'\t' read -r b c _; do
+    [ "$c" = "$p" ] && return 0
+  done < "$MANIFEST"
+  return 1
 }
 
 # --- Icon handling ---------------------------------------------------------
@@ -433,4 +531,84 @@ require_host() {
     || die "podman is not installed or not on PATH. https://podman.io/docs/installation"
   [ -f "$PROVISION_SCRIPT" ] \
     || die "provision-container.sh not found next to this script (looked in $SCRIPT_DIR)."
+}
+
+# --- Terminal-only binary export ------------------------------------------
+#
+# A target that turns out terminal-only - a command-line tool with no GUI
+# window, whether it shipped a .desktop (htop) or none (ripgrep) - has nothing
+# to export to the host app grid. Instead of a launcher, offer to
+# `distrobox-export --bin` each binary the packages provide: that lands a
+# wrapper in ~/.local/bin so you can run the command from any host terminal.
+# This fires for any target kind (.deb, .tar.gz, apt) when no GUI launcher was
+# exported and the app is not already recorded in the manifest.
+# `Terminal=true` / `ConsoleOnly` entries are classified terminal-only unless
+# their Exec binary actually links a GUI toolkit (see desktop_is_terminal).
+
+# binaries_for PKG -> echoes every executable the package owns under /usr/bin
+# or /usr/sbin (deduped across calls by the caller's sort -u).
+binaries_for() {
+  local pkg="$1"
+  # shellcheck disable=SC2016 # 'dpkg...' runs in the container; host must not expand $.
+  distrobox enter "$CONTAINER_NAME" -- sh -c \
+    'dpkg -L "$1" 2>/dev/null | grep -E "^/usr/(bin|sbin)/" | grep -v "/$" \
+     | while read -r b; do [ -x "$b" ] && printf "%s\n" "$b"; done | sort -u' \
+    b "$pkg" 2>/dev/null || true
+}
+
+# offer_export_bins PKGS... : given the requested package list, find the
+# binaries they provide and ask whether to export them to the host PATH.
+# In non-interactive/CI runs, log a Note and skip instead of changing the env
+# without a yes.
+offer_export_bins() {
+  local pkg b
+  local -a bins=()
+  for pkg in "$@"; do
+    while IFS= read -r b; do
+      [ -n "$b" ] || continue
+      bins+=("$b")
+    done < <(binaries_for "$pkg")
+  done
+  if [ "${#bins[@]}" -eq 0 ]; then
+    note "no binaries exported by these packages were found on PATH - run them inside the box via 'distrobox enter $CONTAINER_NAME -- <cmd>'."
+    return 0
+  fi
+
+  if ! may_prompt; then
+    note "terminal-only target: binaries (${bins[*]}) not exported because no TTY/--wizard. Re-run to add them to host PATH."
+    return 0
+  fi
+
+  echo "This target added no GUI launcher - it looks like a terminal-only app."
+  echo "Binaries it provides:"
+  local i=1
+  for b in $(printf '%s\n' "${bins[@]}" | sort -u); do
+    echo "  $((i++)). $b"
+  done
+  printf 'Export these to the host PATH so you can run them from any terminal? [y/N] '
+  local ans
+  read -r ans || ans=""
+  case "$ans" in
+    [yY]|[yY][eE][sS])
+      for b in $(printf '%s\n' "${bins[@]}" | sort -u); do
+        _export_bin "$b"
+      done
+      ;;
+    *)
+      echo "Skipping. Run them inside the box with: distrobox enter $CONTAINER_NAME -- <cmd>"
+      ;;
+  esac
+}
+
+# _export_bin ABS_PATH: distrobox-export one container binary onto the host
+# PATH and record it in the manifest for uninstall.
+_export_bin() {
+  local abs="$1" name
+  name="$(basename "$abs")"
+  echo "Exporting '$name' to host PATH..."
+  if distrobox enter "$CONTAINER_NAME" -- distrobox-export --bin "$abs"; then
+    record_manifest_bin "$name"
+  else
+    echo "Warning: could not export $name to the host PATH." >&2
+  fi
 }

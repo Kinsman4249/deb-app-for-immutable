@@ -9,8 +9,9 @@
 #
 #   1. ensures a shared Debian distrobox container exists (named "deb-apps" by
 #      default, reused across apps);
-#   2. for each `--target`, classifies it (a .deb or a .tar.gz that bundles a
-#      .deb) and stages it under $HOME so the container can reach it;
+#   2. for each `--target`, classifies it (a .deb, a .tar.gz that bundles a
+#      .deb, or an `apt install` request) and stages it under $HOME so the
+#      container can reach it;
 #   3. installs the deb inside the container (resolving dependencies, with a
 #      systemctl shim so .debs whose postinst calls systemctl still install in
 #      the no-systemd box);
@@ -30,6 +31,8 @@
 # Usage:
 #   ./install-deb.sh --target path/to/app.deb            install and export an app
 #   ./install-deb.sh --target path/to/app.tar.gz         tarball bundling a .deb
+#   ./install-deb.sh --target "apt install vlc"          install a package from Debian apt
+#   ./install-deb.sh --target htop                       bare package name works too
 #   ./install-deb.sh --target a.deb --target b.tar.gz    install several (one box)
 #   ./install-deb.sh --target app.deb --name APP         export only the matching
 #                                                          desktop entry
@@ -48,7 +51,7 @@ set -euo pipefail
 
 # Bump whenever the script's install logic changes. Only shown in --debug, so
 # you can tell which version produced a given log.
-BUILD="2026.08.17-1"
+BUILD="2026.08.18-2"
 
 DEBUG=0
 GPU_MODE=""          # ""=auto, gpu, no-gpu
@@ -151,15 +154,19 @@ if [ "$WIZARD" -eq 1 ] && [ "$NON_INTERACTIVE" -eq 1 ]; then
   die "--wizard and --non-interactive are mutually exclusive."
 fi
 if [ "${#TARGETS[@]}" -eq 0 ]; then
-  die "no --target given. Pass --target path/to/app.deb or --target app.tar.gz."
+  die "no --target given. Pass --target path/to/app.deb, app.tar.gz, or \"apt install P\"/a package name."
 fi
 if [ -n "$GPU_MODE" ] && [ "$GPU_MODE" = "gpu" ] && [ ! -d /dev/dri ]; then
   echo "Note: --gpu was passed but no /dev/dri exists on this host."
 fi
 
-# install_one TARGET: full auto-detect pipeline for a single artifact.
+# install_one TARGET: install a single archive or apt-package target.
 install_one() {
   local target="$1" kind
+  if is_apt_target "$target"; then
+    _install_apt_target "$target"
+    return 0
+  fi
   [ -f "$target" ] || die "not a file: $target"
   kind="$(classify_target "$target")"
   case "$kind" in
@@ -173,6 +180,19 @@ install_one() {
       die "could not classify $target (file reported: $(file -b "$target"))."
       ;;
   esac
+}
+
+# _install_apt_target TARGET: parse an `apt install P` / bare package list and
+# install it inside the box. If no GUI launcher is exported, the shared
+# _run_and_export pipeline offers the packages' binaries for host PATH export.
+_install_apt_target() {
+  local pkgs
+  local -a pkglist
+  pkgs="$(apt_packages "$1")"
+  [ -n "$pkgs" ] || die "no package names in apt target: $1"
+  read -ra pkglist <<<"$pkgs"
+  echo "apt target detected; installing package(s): $pkgs"
+  _run_and_export "apt:${pkgs}" "${pkglist[@]}"
 }
 
 # _install_tar_target TARBALL: extract, locate its .deb(s), install one.
@@ -191,24 +211,58 @@ _install_tar_target() {
 }
 
 _install_deb_target() {
-  local staged="$1" before after out
+  local staged="$1"
+  staged="$(stage_file "$staged")"
+  _run_and_export "$staged"
+}
+
+# _run_and_export PROVISION_ARG [PKGS...]: shared provision + desktop-diff +
+# export pipeline for .deb, tarball and apt-package targets. PROVISION_ARG is
+# either a staged container-visible .deb path or "apt:<packages>"; PKGS is the
+# requested package list (apt targets only), used to offer a terminal-only bin
+# export when the target adds no GUI launcher. Apps already recorded in the
+# manifest never re-trigger the offer.
+_run_and_export() {
+  local arg="$1"
+  local -a offer_pkgs=() fresh=()
+  local p
+  if [ $# -gt 1 ]; then
+    read -ra offer_pkgs <<<"$2" 2>/dev/null || true
+  fi
+  local before after out
   ensure_container
   before="$(mktemp)"
   after="$(mktemp)"
-  staged="$(stage_file "$staged")"
   list_desktops > "$before"
 
-  out="$(run_provision "$staged")"
+  out="$(run_provision "$arg")"
   capture_facts "$out"
   echo "$out" | grep -v '^##DEBAPP_' | grep -v '^\(package \|shimmed \|desktop \)' || true
 
   list_desktops > "$after"
+  EXPORTED_ANY=0
   choose_and_export "$before" "$after"
   rm -f "$before" "$after"
+
+  # Terminal-only target (no GUI launcher exported): fall back to the requested
+  # packages' binaries, for .deb/.tar.gz/apt alike, unless already recorded.
+  if [ "$EXPORTED_ANY" -eq 0 ]; then
+    if [ "${#offer_pkgs[@]}" -eq 0 ] && [ -n "$FACTS_PACKAGE" ]; then
+      offer_pkgs=("$FACTS_PACKAGE")
+    fi
+    for p in "${offer_pkgs[@]}"; do
+      manifest_has_pkg "$p" || fresh+=("$p")
+    done
+    if [ "${#fresh[@]}" -gt 0 ]; then
+      offer_export_bins "${fresh[@]}"
+    fi
+  fi
 }
 
-# choose_and_export BEFORE AFTER: diff desktops, filter hidden, disambiguate,
-# then export each. Records each entry in the manifest (via export_desktops).
+# choose_and_export BEFORE AFTER: diff desktops, then split the new entries into
+# hidden (never export) / terminal-only (no GUI window - skip the launcher, the
+# caller offers a PATH command instead) / visible GUI (export). Records each
+# exported entry in the manifest (via export_desktops).
 choose_and_export() {
   local before="$1" after="$2" base export_name
   local -a new=() visible=() chosen=()
@@ -227,13 +281,17 @@ choose_and_export() {
   local i=1
   for base in "${new[@]}"; do
     echo "  $((i++)). $base"
-    if ! is_hidden "$base"; then
+    if is_hidden "$base"; then
+      continue                                        # hidden: never exported
+    elif desktop_is_terminal "$base"; then
+      echo "     terminal-only (no GUI window); offering a host PATH command instead."
+    else
       visible+=("$base")
     fi
   done
 
   if [ "${#visible[@]}" -eq 0 ]; then
-    note "all new entries are Hidden/NoDisplay - nothing exported to the app grid."
+    note "no GUI desktop entries were added (hidden and/or terminal-only) - offering a CLI export instead."
     return 0
   fi
 
@@ -277,6 +335,10 @@ echo "Done. Every target was installed into '$CONTAINER_NAME' and its desktop"
 echo "entries exported to the host app menu. Launch them like any native app -"
 echo "they open the app via 'distrobox enter $CONTAINER_NAME -- ...'."
 echo "Re-run this script with more --targets to add apps to the same container,"
-echo "or run ./uninstall-app.sh --list to query and remove exported launchers."
+echo "including apt packages (--target \"apt install P\"). Terminal-only"
+echo "packages that ship no GUI launcher are offered for host PATH export instead."
+echo "Query/remove any of it with ./uninstall-app.sh --list."
 echo "GPU notes are logged above per target; --app-args can pass launch flags."
-[ -n "$APP_ARGS" ] && echo "Note: --app-args='$APP_ARGS' is accepted for per-app launch flags; the exported launcher does not inject extra args by default."
+if [ -n "$APP_ARGS" ]; then
+  echo "Note: --app-args='$APP_ARGS' is accepted for per-app launch flags; the exported launcher does not inject extra args by default."
+fi

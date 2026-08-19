@@ -13,17 +13,21 @@
 #   ./uninstall-app.sh --query                 (same as --list)
 #   ./uninstall-app.sh --remove APP            default: unexport + purge that app
 #   ./uninstall-app.sh --app NAME              unexport only (leave package)
+#   ./uninstall-app.sh --all                   unexport + purge EVERYTHING recorded
+#   ./uninstall-app.sh --force                 skip the --all confirmation prompt
 #   ./uninstall-app.sh --container NAME        container to act on (default deb-apps)
 #   ./uninstall-app.sh --debug                 print every command run
 #   ./uninstall-app.sh --help                  show this help
 #
 set -euo pipefail
 
-BUILD="2026.08.17-1"
+BUILD="2026.08.18-3"
 
 DO_LIST=0
 DO_REMOVE=""
 APP_NAME=""
+DO_ALL=0
+DO_FORCE=0
 DEBUG=0
 
 # Source the shared host-side library for CONTAINER_NAME/CONFIG_DIR/manifest
@@ -32,7 +36,7 @@ DEBUG=0
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-auto.sh"
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -44,6 +48,14 @@ while [ $# -gt 0 ]; do
       ;;
     --list|--query)
       DO_LIST=1
+      shift
+      ;;
+    --all)
+      DO_ALL=1
+      shift
+      ;;
+    --force)
+      DO_FORCE=1
       shift
       ;;
     --remove)
@@ -88,14 +100,15 @@ manifest_exists() {
 }
 
 # rows APP -> prints "desktop_base<TAB>container" for every row matching APP by
-# package name OR desktop stem (codium, codium.desktop, splashtop-business...).
+# package name OR desktop stem (codium, codium.desktop, splashtop-business...)
+# OR the bare `bin:` command name (rg for bin:rg).
 rows() {
   local app="$1" base pkg ctn
   [ "$DO_LIST" -eq 1 ] && return 0
   while IFS=$'\t' read -r base pkg ctn; do
     [ -n "$base" ] || continue
     if [ "$pkg" = "$app" ] || [ "${base%.desktop}" = "${app%.desktop}" ] \
-       || [ "$base" = "$app" ]; then
+       || [ "${base#bin:}" = "$app" ] || [ "$base" = "$app" ]; then
       printf '%s\t%s\n' "$base" "$ctn"
     fi
   done < "$MANIFEST"
@@ -127,7 +140,22 @@ list_apps() {
 # --- Unexport -------------------------------------------------------------
 
 do_unexport() {
-  local base="$1" name="${1%.desktop}" desktop_path
+  local base="$1" name desktop_path
+  # A `bin:<name>` row is a terminal-only export - unexport the wrapper and
+  # drop its ~/.local/bin launcher instead of a desktop entry.
+  case "$base" in
+    bin:*)
+      name="${base#bin:}"
+      echo "Unexporting '$name' from host PATH..."
+      local bpath=""
+      bpath="$(distrobox enter "$CONTAINER_NAME" -- command -v "$name" 2>/dev/null || true)"
+      distrobox enter "$CONTAINER_NAME" -- distrobox-export \
+        --bin "${bpath:-/usr/bin/$name}" --delete >/dev/null 2>&1 || true
+      rm -f "$HOME/.local/bin/$name" 2>/dev/null || true
+      return 0
+      ;;
+  esac
+  name="${base%.desktop}"
   desktop_path="$(locate_desktop "$base" 2>/dev/null || true)"
   if [ -n "$desktop_path" ]; then
     distrobox enter "$CONTAINER_NAME" -- distrobox-export \
@@ -240,6 +268,56 @@ pkg_for() {
   printf 'unknown\n'
 }
 
+# --- Remove everything (--all) --------------------------------------------
+
+# confirm_all -> returns 0 when the --all wipe may proceed. --force skips the
+# prompt; otherwise we confirm on a TTY (reusing may_prompt) and abort in
+# non-interactive runs rather than wiping the env silently.
+confirm_all() {
+  if [ "$DO_FORCE" -eq 1 ]; then
+    return 0
+  fi
+  if ! may_prompt; then
+    echo "Note: --all in non-interactive mode; nothing changed. Pass --force to skip the prompt." >&2
+    return 1
+  fi
+  printf 'Unexport AND purge every app recorded for container %s? [y/N] ' "$CONTAINER_NAME" >&2
+  local ans
+  read -r ans || ans=""
+  case "$ans" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    *) echo "Aborted. Nothing was changed." >&2; return 1 ;;
+  esac
+}
+
+# do_all: unexport every entry, purge each distinct package, clear the manifest
+# and the legacy flat exported file.
+do_all() {
+  if ! manifest_exists; then
+    echo "Nothing recorded in the manifest at $MANIFEST - nothing to remove."
+    return 0
+  fi
+  if ! confirm_all; then
+    return 0
+  fi
+  local base pkg ctn
+  declare -A pkgs
+  while IFS=$'\t' read -r base pkg ctn; do
+    [ -n "$base" ] || continue
+    do_unexport "$base"
+    if [ -n "$pkg" ] && [ "$pkg" != "unknown" ]; then
+      pkgs["$pkg"]=1
+    fi
+  done < "$MANIFEST"
+  local p
+  for p in "${!pkgs[@]}"; do
+    purge_package "$p"
+  done
+  rm -f "$MANIFEST" "$EXPORTED_FILE"
+  refresh_desktop_db
+  echo "Removed everything recorded for '$CONTAINER_NAME'."
+}
+
 # --- Entry ----------------------------------------------------------------
 
 if [ "$DO_LIST" -eq 1 ]; then
@@ -247,8 +325,14 @@ if [ "$DO_LIST" -eq 1 ]; then
   exit 0
 fi
 
+if [ "$DO_ALL" -eq 1 ]; then
+  container_exists || die "container '$CONTAINER_NAME' does not exist. Nothing to uninstall."
+  do_all
+  exit 0
+fi
+
 if [ -z "$DO_REMOVE" ] && [ -z "$APP_NAME" ]; then
-  die "nothing to do. Pass --remove APP, --app NAME, or --list."
+  die "nothing to do. Pass --remove APP, --app NAME, --all, or --list."
 fi
 
 container_exists || die "container '$CONTAINER_NAME' does not exist. Nothing to uninstall."

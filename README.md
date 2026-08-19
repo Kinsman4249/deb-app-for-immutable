@@ -52,11 +52,15 @@ Run from a host desktop terminal:
 ```
 ./install-deb.sh --target ~/Downloads/splashtop.tar.gz   # tarball bundling a .deb
 ./install-deb.sh --target ~/Downloads/app.deb             # plain .deb
+./install-deb.sh --target "apt install vlc"              # install from Debian apt
+./install-deb.sh --target htop                            # bare package name works too
 ./install-deb.sh --target a.deb --target b.tar.gz         # several apps, one container
 ./install-deb.sh --target app.deb --name APP              # export one entry only
 ./uninstall-app.sh --list                                  # query what's installed
 ./uninstall-app.sh --remove APP                            # unexport + purge that app
 ./uninstall-app.sh --app APP                               # unexport only (keep pkg)
+./uninstall-app.sh --all                                   # unexport + purge everything
+./uninstall-app.sh --all --force                           # ... skip the confirmation
 distrobox rm deb-apps                                      # remove the whole container
 ```
 
@@ -74,8 +78,25 @@ up in taskbars/docks, not just the app grid.
 
 A manifest under `~/.config/deb-apps/manifest.tsv` records each exported entry
 (package name, desktop base, container), so `uninstall-app.sh` can query and
-remove one app atomically without touching the box or the other apps. No
-downloads happen here - you supply the artifact.
+remove one app atomically without touching the box or the other apps. For
+`.deb`/`.tar.gz` targets no downloads happen here - you supply the artifact;
+`apt` targets instead pull their packages from the Debian repos inside the box.
+
+`--target` also accepts an apt package instead of a file: `--target "apt
+install vlc"` (or a bare package name like `--target htop`) installs it from
+the Debian repos inside the box. GUI packages are handled the same way as a
+`.deb` (their desktop entries are diffed and exported). If the target turns out
+to be terminal-only - a command-line tool with no GUI window, whether it shipped
+a `.desktop` (`htop`) or none (`ripgrep`) - `install-deb.sh` instead offers to
+run `distrobox-export --bin` on the binaries the packages provide, putting
+wrapper commands on your host PATH so you can run them from any terminal
+(recorded as `bin:<name>` in the manifest, so `uninstall-app.sh --remove` cleans
+them up too). This terminal-only fallback applies to every target kind: `.deb`,
+`.tar.gz`, and apt. A `.desktop` is treated as terminal-only only on a positive
+signal - `Terminal=true` or a `ConsoleOnly` category - and we still trust the
+Exec binary over the metadata: if it links a GUI toolkit (X11/XCB/Wayland/GTK/
+Qt/SDL/EGL/GL), we export the launcher rather than downgrade a real GUI app to a
+PATH command. Apps already recorded in the manifest are never re-offered.
 
 ## Configuration
 
