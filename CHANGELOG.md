@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-18
+
+### Added
+
+- `install-deb.sh --target "apt install vlc"` (or a bare package name like `--target htop`) now installs a package from the Debian apt repos directly inside the box, so the target no longer has to be a local `.deb`/`.tar.gz`. It goes through the same `provision-container.sh` pipeline (systemctl shim, apt-get install, desktop diff and export).
+- Terminal-only targets - a command-line tool with no GUI window, whether it shipped a `.desktop` (`htop`) or none (`ripgrep`) - are now offered a `distrobox-export --bin` host PATH export instead of a desktop launcher. `lib-auto.sh` lists every executable the target's packages own under `/usr/bin`/`/usr/sbin` and, on a `y` prompt (subject to `--wizard`/`--non-interactive`), exports each so you can run it from any host terminal. These are recorded in the manifest as `bin:<name>` and are cleaned up by `uninstall-app.sh`. The fallback now applies to every target kind (`.deb`, `.tar.gz`, apt), not just apt packages.
+- Terminal-only detection now matches the spirit, not the letter: a `.desktop` is classified terminal-only only on a positive signal (`Terminal=true` or a `ConsoleOnly` category), and only when its Exec binary links no GUI toolkit (X11/XCB/Wayland/GTK/Qt/SDL/EGL/GL) - so a flagged-but-GUI app still exports its launcher, and an app already recorded in the manifest is never re-offered a PATH export.
+- `uninstall-app.sh --list` / `--query` now shows every recorded app grouped by package (desktop entries and `bin:` PATH exports), so you can see what's installed and remove by app or package name.
+- `uninstall-app.sh --all` now unexports and purges every app recorded for the container in one pass, deduplicating packages so each is purged once. It prompts for confirmation on a TTY and aborts in non-interactive runs; `--force` skips the prompt.
+
 ## [1.0.0] - 2026-08-18
 
 ### Added
